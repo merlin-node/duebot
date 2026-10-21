@@ -303,14 +303,14 @@ def v_home(uid, note=None):
         lines.append("还没有订阅，点「➕ 添加订阅」开始吧")
     days = remind_days(u)
     lines.append(f"提醒　{days_label(days) + ' · ' + u['time'] if days else '已关闭'}")
-    last = [B("📤 导出备份", "exp")]
-    if uid == ADMIN:
-        last.append(B("👥 用户管理", "U"))
-    return "\n".join(lines), Kb([
+    rows = [
         [B("📋 订阅列表", "L:0"), B("➕ 添加订阅", "add")],
         [B("⏰ 提醒设置", "set"), B("🔔 预览提醒", "prev")],
-        last,
-    ])
+        [B("📤 导出备份", "exp"), B("📥 导入备份", "imp")],
+    ]
+    if uid == ADMIN:
+        rows.append([B("👥 用户管理", "U")])
+    return "\n".join(lines), Kb(rows)
 
 
 def v_list(uid, page=0):
@@ -464,6 +464,66 @@ def v_user(t):
     rows = [] if t == ADMIN else [[B("🗑 移除用户", f"ux:{t}")]]
     rows.append([B("« 返回", "U")])
     return "\n".join(lines), Kb(rows)
+
+
+def parse_backup(raw):
+    """校验备份文件，返回 (有效订阅列表, 设置, 跳过数)；格式不对返回 None"""
+    try:
+        data = json.loads(raw)
+        items = data["subs"]
+        assert isinstance(items, list)
+    except Exception:
+        return None
+    good, bad = [], 0
+    for it in items:
+        try:
+            name = " ".join(str(it["name"]).split())
+            unit = " ".join(str(it["unit"]).split())
+            cycle = it["cycle"]
+            d = date.fromisoformat(it["due"])
+            amount = parse_amount(str(it["amount"]))
+            anchor = int(it.get("anchor") or d.day)
+            assert 0 < len(name) <= 40 and 0 < len(unit) <= 10 and cycle in CYCLES
+            assert 2000 <= d.year <= 2100 and amount is not None and 1 <= anchor <= 31
+        except Exception:
+            bad += 1
+            continue
+        good.append({"name": name, "unit": unit, "cycle": cycle, "amount": str(amount), "anchor": anchor,
+                     "due": roll_date(d, cycle, anchor).isoformat()})
+    st, raw_st = {}, data.get("settings") or {}
+    if isinstance(raw_st, dict):
+        if isinstance(raw_st.get("days"), str):
+            ds = {x for x in raw_st["days"].split(",") if x}
+            if ds <= {str(x) for x in DAY_OPTS}:
+                st["days"] = ",".join(sorted(ds, key=int, reverse=True))
+        if t := parse_time(str(raw_st.get("time", ""))):
+            st["time"] = t
+        if str(raw_st.get("quiet")) in ("0", "1"):
+            st["quiet"] = int(raw_st["quiet"])
+    return good, st, bad
+
+
+def sub_key(s):
+    return (s["name"], num(s["amount"]), s["unit"], s["cycle"])
+
+
+def v_import(err=None):
+    lines = ["<b>📥 导入备份</b>", LINE]
+    if err:
+        lines.append(f"⚠️ {err}")
+    lines.append("请发送之前导出的 JSON 文件")
+    return "\n".join(lines), Kb([[B("❌ 取消", "home")]])
+
+
+def v_import_preview(uid, imp):
+    have = len(subs(uid))
+    lines = ["<b>📥 导入备份</b>", LINE, f"备份里有　<b>{len(imp['subs'])}</b> 个订阅"]
+    if imp["bad"]:
+        lines.append(f"无效跳过　{imp['bad']} 个")
+    lines += [f"当前已有　{have} 个", "",
+              "<b>替换</b>：删掉现有订阅，换成备份里的，提醒设置一起恢复",
+              "<b>追加</b>：保留现有订阅，把备份里的加进来，相同的跳过"]
+    return "\n".join(lines), Kb([[B("替换全部", "imr"), B("追加", "ima")], [B("❌ 取消", "home")]])
 
 
 def v_adduser(err=None):
@@ -750,6 +810,35 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                     filename=f"duebot-{today()}.json", caption="📤 订阅备份")
         return
 
+    if d == "imp":
+        reset(ud)
+        ud["await"] = ("import",)
+        return await show(v_import())
+    if d in ("imr", "ima") and (imp := ud.pop("import", None)):
+        reset(ud)
+        new = imp["subs"]
+        if d == "imr":
+            with db() as c:
+                c.execute("DELETE FROM subs WHERE uid=?", (uid,))
+            if imp["settings"]:
+                upd_user(uid, **imp["settings"])
+                schedule(ctx.application, uid)
+            skipped = 0
+        else:
+            have = {sub_key(x) for x in subs(uid)}
+            fresh = [x for x in new if sub_key(x) not in have]
+            skipped, new = len(new) - len(fresh), fresh
+        room = MAX_SUBS - len(subs(uid))
+        over = max(0, len(new) - room)
+        for x in new[:room]:
+            add_sub(uid, x)
+        note = f"✅ 已导入 {len(new) - over} 个订阅"
+        if skipped:
+            note += f"，跳过 {skipped} 个相同的"
+        if over:
+            note += f"，超出上限 {over} 个未导入"
+        return await show(v_home(uid, note))
+
     # 管理员
     if uid == ADMIN:
         if d == "U":
@@ -777,6 +866,31 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # 失效按钮（如重启后点旧面板里的半截流程）回到首页
     reset(ud)
     await show(v_home(uid, "⚠️ 操作已失效，请重新开始"))
+
+
+async def on_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not (uid := gate(update)):
+        return
+    ud, msg = ctx.user_data, update.message
+    if ud.get("await") != ("import",):
+        return await msg.reply_text("要导入备份，请先在面板里点「📥 导入备份」")
+    doc = msg.document
+    try:
+        await msg.delete()
+    except TelegramError:
+        pass
+    if (doc.file_size or 0) > 1024 * 1024:
+        return await render(ctx, uid, v_import("文件太大"))
+    raw = await (await doc.get_file()).download_as_bytearray()
+    parsed = parse_backup(bytes(raw).decode("utf-8", "ignore"))
+    if not parsed:
+        return await render(ctx, uid, v_import("不是 DueBot 的备份文件"))
+    good, st, bad = parsed
+    if not good:
+        return await render(ctx, uid, v_import("备份里没有有效的订阅"))
+    ud.pop("await", None)
+    ud["import"] = {"subs": good, "settings": st, "bad": bad}
+    await render(ctx, uid, v_import_preview(uid, ud["import"]))
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -905,6 +1019,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=new))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(new & filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(new & filters.Document.ALL, on_doc))
     app.add_error_handler(on_error)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 

@@ -16,7 +16,7 @@ echo -e "\n${G}━━━━━━━━  DueBot 安装  ━━━━━━━━
 # 1. Docker
 if ! command -v docker >/dev/null 2>&1; then
   warn "未检测到 Docker，开始自动安装…"
-  curl -fsSL https://get.docker.com | sh || die "Docker 安装失败，国内机器请看 README 里的镜像安装方法"
+  curl -fsSL https://get.docker.com | sh || die "Docker 安装失败"
 fi
 if docker compose version >/dev/null 2>&1; then DC="docker compose"
 elif command -v docker-compose >/dev/null 2>&1; then DC="docker-compose"
@@ -42,14 +42,11 @@ if [ ! -f .env ]; then
     [[ "$UIDS" =~ ^[0-9]+$ ]] && break
     warn "只能是数字，例如 123456789"
   done
-  ask "代理地址（海外机器直接回车跳过）：" PROXY
-  PROXY="$(echo "$PROXY" | tr -d '[:space:]')"
 
   {
     echo "BOT_TOKEN=$TOKEN"
     echo "ADMIN_ID=$UIDS"
     echo "TZ=Asia/Shanghai"
-    [ -n "$PROXY" ] && echo "PROXY=$PROXY"
   } > .env
   chmod 600 .env
   ok "配置已保存"
@@ -58,7 +55,7 @@ fi
 # 3. 启动
 mkdir -p data
 echo "拉取镜像并启动…"
-$DC pull || die "镜像拉取失败：请确认 GitHub 上的 duebot 镜像已设为 Public（见 README）"
+$DC pull || die "镜像拉取失败"
 $DC up -d
 sleep 5
 
