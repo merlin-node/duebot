@@ -1,0 +1,14 @@
+services:
+  duebot:
+    image: ghcr.io/merlin-node/duebot:latest
+    container_name: duebot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    # 不开任何端口，bot 只主动连 Telegram
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "1"
