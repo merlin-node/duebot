@@ -31,7 +31,7 @@ MAX_SUBS = 100
 HTML = ParseMode.HTML
 CYCLES = {"m1": ("月付", 1), "m3": ("季付", 3), "m6": ("半年付", 6),
           "y1": ("年付", 12), "once": ("一次性", 0)}
-DAY_OPTS = [0, 1, 3, 7, 15, 30]
+WIN_OPTS = [1, 3, 7, 15, 30]  # 到期前多少天开始每天提醒
 PAGE = 8
 WEEK = "一二三四五六日"
 LINE = "━━━━━━━━━━━━"
@@ -72,7 +72,7 @@ def init_db():
         fresh = not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
         c.execute("""CREATE TABLE IF NOT EXISTS users(
             uid INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
-            days TEXT NOT NULL DEFAULT '7,3,1', time TEXT NOT NULL DEFAULT '09:00',
+            days TEXT NOT NULL DEFAULT '7', time TEXT NOT NULL DEFAULT '09:00',
             quiet INTEGER NOT NULL DEFAULT 1, last TEXT NOT NULL DEFAULT '', panel INTEGER)""")
         c.execute("""CREATE TABLE IF NOT EXISTS subs(
             id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER NOT NULL,
@@ -129,8 +129,10 @@ def del_user(uid):
         c.execute("DELETE FROM users WHERE uid=?", (uid,))
 
 
-def remind_days(u):
-    return sorted({int(x) for x in str(u["days"]).split(",") if x}, reverse=True)
+def window(u):
+    """到期前几天开始每天提醒；None 表示关闭。兼容旧版的「7,3,1」，取最大值"""
+    vals = [int(x) for x in str(u["days"]).split(",") if x.strip().isdigit()]
+    return max(vals) if vals else None
 
 
 # 订阅（所有查询都带 uid，用户之间互相看不到）
@@ -278,8 +280,10 @@ def monthly(ss):
                        for s in ss if CYCLES[s["cycle"]][1])
 
 
-def days_label(days):
-    return " · ".join("当天" if d == 0 else f"{d}天" for d in days)
+def win_label(w):
+    if w is None:
+        return "已关闭"
+    return "仅到期当天" if w == 0 else f"到期前 {w} 天起每天"
 
 
 def uname(u):
@@ -301,8 +305,8 @@ def v_home(uid, note=None):
             lines.append(f"月均　{m}")
     else:
         lines.append("还没有订阅，点「➕ 添加订阅」开始吧")
-    days = remind_days(u)
-    lines.append(f"提醒　{days_label(days) + ' · ' + u['time'] if days else '已关闭'}")
+    w = window(u)
+    lines.append(f"提醒　{win_label(w)}{' · ' + u['time'] if w is not None else ''}")
     rows = [
         [B("📋 订阅列表", "L:0"), B("➕ 添加订阅", "add")],
         [B("⏰ 提醒设置", "set"), B("🔔 预览提醒", "prev")],
@@ -412,21 +416,21 @@ def v_edit_cycle(uid, i):
 
 def v_settings(uid, note=None):
     u = user(uid)
-    days = set(remind_days(u))
+    w = window(u)
 
-    def tog(d):
-        return B(("✅ " if d in days else "▫️ ") + ("当天" if d == 0 else f"{d}天"), f"t:{d}")
+    def opt(d):
+        return B(("✅ " if w == d else "▫️ ") + f"{d}天", f"w:{d}")
 
     quiet = int(u["quiet"])
     lines = [note, ""] if note else []
     lines += ["<b>⏰ 提醒设置</b>", LINE,
-              f"提前　{days_label(sorted(days, reverse=True)) or '未选择（不提醒）'}",
+              f"提醒　{win_label(w)}",
               f"时间　每天 {u['time']}",
               f"空闲　{'没有到期时不推送' if quiet else '没有到期也推送一条'}",
-              "", "<i>点击下方切换提前天数</i>"]
+              "", "<i>选择到期前几天开始，每天推送直到到期当天</i>"]
     return "\n".join(lines), Kb([
-        [tog(d) for d in DAY_OPTS[:3]],
-        [tog(d) for d in DAY_OPTS[3:]],
+        [opt(d) for d in WIN_OPTS[:3]],
+        [opt(d) for d in WIN_OPTS[3:]] + [B(("✅ " if w is None else "▫️ ") + "关闭", "w:off")],
         [B(f"🕘 推送时间 {u['time']}", "st")],
         [B(f"📭 没有到期也推送：{'关' if quiet else '开'}", "sq")],
         [B("« 返回", "home")],
@@ -456,11 +460,11 @@ def v_user(t):
     u = user(t)
     if not u:
         return v_users()
-    days = remind_days(u)
+    w = window(u)
     lines = [f"<b>{uname(u)}</b>{'　👑 管理员' if t == ADMIN else ''}", LINE,
              f"ID　<code>{t}</code>",
              f"订阅　{len(subs(t))} 个",
-             f"提醒　{days_label(days) + ' · ' + u['time'] if days else '已关闭'}"]
+             f"提醒　{win_label(w)}{' · ' + u['time'] if w is not None else ''}"]
     rows = [] if t == ADMIN else [[B("🗑 移除用户", f"ux:{t}")]]
     rows.append([B("« 返回", "U")])
     return "\n".join(lines), Kb(rows)
@@ -493,9 +497,11 @@ def parse_backup(raw):
     st, raw_st = {}, data.get("settings") or {}
     if isinstance(raw_st, dict):
         if isinstance(raw_st.get("days"), str):
-            ds = {x for x in raw_st["days"].split(",") if x}
-            if ds <= {str(x) for x in DAY_OPTS}:
-                st["days"] = ",".join(sorted(ds, key=int, reverse=True))
+            vals = [int(x) for x in raw_st["days"].split(",") if x.strip().isdigit()]
+            if not raw_st["days"].strip():
+                st["days"] = ""
+            elif vals and max(vals) <= 30:
+                st["days"] = str(max(vals))
         if t := parse_time(str(raw_st.get("time", ""))):
             st["time"] = t
         if str(raw_st.get("quiet")) in ("0", "1"):
@@ -538,8 +544,8 @@ def v_adduser(err=None):
 def notice(uid, force=False):
     roll_all(uid)
     t, u, ss = today(), user(uid), subs(uid)
-    days = set(remind_days(u))
-    hits = sorted(((left(s), s) for s in ss if left(s) in days), key=lambda x: x[0])
+    w = window(u)
+    hits = sorted(((left(s), s) for s in ss if w is not None and 0 <= left(s) <= w), key=lambda x: x[0])
     rolled = [(s["name"], s["due"]) for s in ss if s["rolled_at"] == t.isoformat()]
     if not hits and not rolled and not force and int(u["quiet"]):
         return None
@@ -786,9 +792,8 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if d == "set":
         reset(ud)
         return await show(v_settings(uid))
-    if d.startswith("t:") and d[2:] in {str(x) for x in DAY_OPTS}:
-        days = set(remind_days(user(uid))) ^ {int(d[2:])}
-        upd_user(uid, days=",".join(map(str, sorted(days, reverse=True))))
+    if d.startswith("w:") and d[2:] in {"off", *map(str, WIN_OPTS)}:
+        upd_user(uid, days="" if d[2:] == "off" else d[2:])
         return await show(v_settings(uid))
     if d == "sq":
         upd_user(uid, quiet=0 if int(user(uid)["quiet"]) else 1)
